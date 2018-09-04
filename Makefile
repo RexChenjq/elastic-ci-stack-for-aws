@@ -1,67 +1,93 @@
-.PHONY: all clean build build-ami upload create-stack update-stack download-mappings toc
+.PHONY: all clean build packer upload create-stack update-stack download-mappings toc
 
-BUILDKITE_STACK_BUCKET ?= buildkite-aws-stack
-BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
+S3_BUCKET ?= buildkite-aws-stack
+S3_BUCKET_PREFIX =? dev/$(shell git rev-parse --abbrev-ref HEAD)
+AWS_REGION ?= us-east-1
 VERSION ?= $(shell git describe --tags --candidates=1)
-STACK_NAME ?= buildkite
-SHELL=/bin/bash -o pipefail
-TEMPLATES=templates/description.yml \
-  templates/buildkite-elastic.yml \
-  templates/autoscale.yml \
-  templates/vpc.yml \
-  templates/metrics.yml \
-  templates/outputs.yml
 
+SHELL = /bin/bash -o pipefail
+PACKER_FILES = $(exec find packer/)
+
+# Build the packer AMI, create cloudformation templates and copy to s3
 all: build
 
-build: build/aws-stack.yml
-
-build/aws-stack.yml: $(TEMPLATES)
-	docker run --rm -w /app -v "$(PWD):/app" node:slim bash \
-		-c "yarn install --non-interactive && yarn run generate $(VERSION)"
-
+# Remove any built cloudformation templates and packer output
 clean:
 	-rm -f build/*
+	-rm packer.output
 
-config.json:
-	cp config.json.example config.json
+# -----------------------------------------
+# Template creation
 
-build-ami: config.json
-	docker run  -e AWS_DEFAULT_REGION  -e AWS_ACCESS_KEY_ID \
-		-e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e PACKER_LOG \
+# Build all the cloudformation templates
+build: build/aws-stack.yml build/agent.yml build/metrics.yml build/vpc.yml
+
+build/aws-stack.yml: templates/aws-stack/template.yml build/mapping.yml
+	sed -e '/AMI Mappings go here/r./build/mapping.yml' templates/aws-stack/template.yml > build/aws-stack.yml
+
+build/agent.yml: templates/agent/template.yml
+	cp templates/agent/template.yml build/agent.yml
+
+build/metrics.yml: templates/metrics/template.yml
+	cp templates/metrics/template.yml build/metrics.yml
+
+build/vpc.yml: templates/vpc/template.yml
+	cp templates/vpc/template.yml build/vpc.yml
+
+# -----------------------------------------
+# AMI creation with Packer
+
+# Use packer to create an AMI
+packer: packer.output
+
+# Use packer to create an AMI and write the output to packer.output
+packer.output: $(PACKER_FILES)
+	docker run \
+		-e AWS_DEFAULT_REGION  \
+		-e AWS_ACCESS_KEY_ID \
+		-e AWS_SECRET_ACCESS_KEY \
+		-e AWS_SESSION_TOKEN \
+		-e PACKER_LOG \
 		-v ${HOME}/.aws:/root/.aws \
-		--rm -v "$(PWD):/src" -w /src/packer hashicorp/packer:1.0.4 \
-			build buildkite-ami.json | tee packer.output
-	jq --arg ImageId $$(grep -Eo 'us-east-1: (ami-.+)' packer.output | cut -d' ' -f2) \
-		'[ .[] | select(.ParameterKey != "ImageId") ] + [{ParameterKey: "ImageId", ParameterValue: $$ImageId}]' \
-		config.json  > config.json.temp
-	mv config.json.temp config.json
+		-v "$(PWD):/src" \
+		--rm \
+		-w /src/packer \
+		hashicorp/packer:1.0.4 build buildkite-ami.json | tee packer.output
 
-upload: build/aws-stack.yml
-	aws s3 sync --acl public-read build s3://$(BUILDKITE_STACK_BUCKET)/
+# Create a mapping.yml file for the ami produced by packer
+build/mapping.yml: packer.output
+	mkdir -p build/
+	printf "Mappings:\n  AWSRegion2AMI:\n    %s: { AMI: %s }\n" \
+		"$(AWS_REGION)" $$(grep -Eo "$(AWS_REGION): (ami-.+)" packer.output | cut -d' ' -f2) > build/mapping.yml
 
-create-stack: config.json build/aws-stack.yml
-	aws cloudformation create-stack \
-	--output text \
-	--stack-name $(STACK_NAME) \
-	--disable-rollback \
-	--template-body "file://$(PWD)/build/aws-stack.yml" \
-	--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-	--parameters "$$(cat config.json)"
+# -----------------------------------------
+# Upload to S3
 
-validate: build/aws-stack.yml
-	aws cloudformation validate-template \
-	--output table \
-	--template-body "file://$(PWD)/build/aws-stack.yml"
+# upload: build/aws-stack.yml
+# 	aws s3 sync --acl public-read build s3://$(BUILDKITE_STACK_BUCKET)/
 
-update-stack: config.json templates/mappings.yml build/aws-stack.yml
-	aws cloudformation update-stack \
-	--output text \
-	--stack-name $(STACK_NAME) \
-	--template-body "file://$(PWD)/build/aws-stack.yml" \
-	--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
-	--parameters "$$(cat config.json)"
+# create-stack: config.json build/aws-stack.yml
+# 	aws cloudformation create-stack \
+# 	--output text \
+# 	--stack-name $(STACK_NAME) \
+# 	--disable-rollback \
+# 	--template-body "file://$(PWD)/build/aws-stack.yml" \
+# 	--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+# 	--parameters "$$(cat config.json)"
 
-toc:
-	docker run -it --rm -v "$(PWD):/app" node:slim bash \
-		-c "npm install -g markdown-toc && cd /app && markdown-toc -i Readme.md"
+# validate: build/aws-stack.yml
+# 	aws cloudformation validate-template \
+# 	--output table \
+# 	--template-body "file://$(PWD)/build/aws-stack.yml"
+
+# update-stack: config.json templates/mappings.yml build/aws-stack.yml
+# 	aws cloudformation update-stack \
+# 	--output text \
+# 	--stack-name $(STACK_NAME) \
+# 	--template-body "file://$(PWD)/build/aws-stack.yml" \
+# 	--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+# 	--parameters "$$(cat config.json)"
+
+# toc:
+# 	docker run -it --rm -v "$(PWD):/app" node:slim bash \
+# 		-c "npm install -g markdown-toc && cd /app && markdown-toc -i Readme.md"

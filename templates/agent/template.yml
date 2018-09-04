@@ -1,3 +1,6 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Buildkite Agent stack"
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -16,7 +19,6 @@ Metadata:
         Parameters:
         - VpcId
         - Subnets
-        - AvailabilityZones
         - SecurityGroupId
         - AssociatePublicIpAddress
 
@@ -82,7 +84,7 @@ Parameters:
       - stable
       - beta
       - edge
-    Default: "beta"
+    Default: "stable"
 
   BuildkiteAgentToken:
     Description: Buildkite agent registration token
@@ -153,6 +155,10 @@ Parameters:
     Default: t2.nano
     MinLength: 1
 
+  ImageId:
+    Type: String
+    Description: Custom AMI to use for instances (must be based on the stack's AMI)
+
   SpotPrice:
     Description: Spot bid price to use for the instances. 0 means normal (non-spot) instances
     Type: String
@@ -195,11 +201,6 @@ Parameters:
   SecurityGroupId:
     Type: String
     Description: Optional - Security group id to assign to instances
-    Default: ""
-
-  ImageId:
-    Type: String
-    Description: Optional - Custom AMI to use for instances (must be based on the stack's AMI)
     Default: ""
 
   ManagedPolicyARN:
@@ -280,15 +281,6 @@ Parameters:
     Description: The value of the Cost Allocation Tag used for billing purposes
     Default: "buildkite-elastic-ci-stack-for-aws"
 
-Outputs:
-  ManagedSecretsBucket:
-    Value:
-      "Fn::If": [CreateSecretsBucket, { Ref: ManagedSecretsBucket }, "" ]
-
-  ManagedSecretsLoggingBucket:
-    Value:
-      "Fn::If": [CreateSecretsBucket, { Ref: ManagedSecretsLoggingBucket }, "" ]
-
 Conditions:
     UseSpotInstances:
       "Fn::Not": [ "Fn::Equals": [ { Ref: SpotPrice }, 0 ] ]
@@ -353,22 +345,6 @@ Mappings:
     readonly  : { Policy: 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly' }
     poweruser : { Policy: 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser' }
     full      : { Policy: 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess' }
-
-  MetricsLambdaBucket:
-    us-east-1 : { Bucket: "buildkite-metrics" }
-    us-east-2 : { Bucket: "buildkite-metrics-us-east-2" }
-    us-west-1 : { Bucket: "buildkite-metrics-us-west-1" }
-    us-west-2 : { Bucket: "buildkite-metrics-us-west-2" }
-    eu-west-1 : { Bucket: "buildkite-metrics-eu-west-1" }
-    eu-west-2 : { Bucket: "buildkite-metrics-eu-west-2" }
-    eu-central-1 : { Bucket: "buildkite-metrics-eu-central-1" }
-    ap-northeast-1 : { Bucket: "buildkite-metrics-ap-northeast-1" }
-    ap-northeast-2 : { Bucket: "buildkite-metrics-ap-northeast-2" }
-    ap-southeast-1 : { Bucket: "buildkite-metrics-ap-southeast-1" }
-    ap-southeast-2 : { Bucket: "buildkite-metrics-ap-southeast-2" }
-    ap-south-1 : { Bucket: "buildkite-metrics-ap-south-1" }
-    sa-east-1 : { Bucket: "buildkite-metrics-sa-east-1" }
-
 
 Resources:
   # Allow ec2 instances to assume a role and be granted the IAMPolicies
@@ -664,9 +640,76 @@ Resources:
   SecurityGroupSshIngress:
     Condition: EnableSshIngress
     Type: AWS::EC2::SecurityGroupIngress
-    Properties: 
+    Properties:
       GroupId: !GetAtt SecurityGroup.GroupId
       IpProtocol: tcp
       FromPort: 22
       ToPort: 22
       CidrIp: 0.0.0.0/0
+
+  AgentScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Condition: UseAutoscaling
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: { Ref: AgentAutoScaleGroup }
+      Cooldown: 300
+      ScalingAdjustment : { Ref: ScaleUpAdjustment }
+
+  AgentScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Condition: UseAutoscaling
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: { Ref: AgentAutoScaleGroup }
+      Cooldown: 300
+      ScalingAdjustment: { Ref: ScaleDownAdjustment }
+
+  AgentUtilizationAlarmHigh:
+   Type: AWS::CloudWatch::Alarm
+   Condition: UseAutoscaling
+   Properties:
+      AlarmDescription: Scale-up if ScheduledJobs > 0 for 1 minute
+      MetricName: ScheduledJobsCount
+      Namespace: Buildkite
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      AlarmActions: [ { Ref: AgentScaleUpPolicy } ]
+      Dimensions:
+        - Name: Queue
+          Value: { Ref: BuildkiteQueue }
+      ComparisonOperator: GreaterThanThreshold
+
+  AgentUtilizationAlarmLow:
+   Type: AWS::CloudWatch::Alarm
+   Condition: UseAutoscaling
+   Properties:
+      AlarmDescription: Scale-down if UnfinishedJobs == 0 for N minutes
+      MetricName: UnfinishedJobsCount
+      Namespace: Buildkite
+      Statistic: Maximum
+      Period: { Ref: ScaleDownPeriod }
+      EvaluationPeriods: 1
+      Threshold: 0
+      AlarmActions: [ { Ref: AgentScaleDownPolicy } ]
+      Dimensions:
+        - Name: Queue
+          Value: { Ref: BuildkiteQueue }
+      ComparisonOperator: LessThanOrEqualToThreshold
+
+Outputs:
+  AutoScalingGroupName:
+    Value: { Ref: AgentAutoScaleGroup }
+
+  InstanceRoleName:
+    Value: { Ref: IAMRole }
+
+  ManagedSecretsBucket:
+    Value:
+      "Fn::If": [CreateSecretsBucket, { Ref: ManagedSecretsBucket }, "" ]
+
+  ManagedSecretsLoggingBucket:
+    Value:
+      "Fn::If": [CreateSecretsBucket, { Ref: ManagedSecretsLoggingBucket }, "" ]
